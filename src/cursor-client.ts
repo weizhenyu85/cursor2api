@@ -136,6 +136,12 @@ async function sendCursorRequestInner(
         const REPEAT_THRESHOLD = 8;       // 同一 delta 连续出现 8 次 → 退化
         let degenerateAborted = false;
 
+        // ★ 行级重复检测：历史消息较多时模型偶发换行重复输出 bug，连续相同行超过阈值则中止并重试
+        let lineBuffer = '';
+        let lastLine = '';
+        let lineRepeatCount = 0;
+        let lineRepeatAborted = false;
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -180,18 +186,49 @@ async function sendCursorRequestInner(
                         }
                     }
 
+                    // ★ 行级重复检测
+                    if (event.type === 'text-delta' && event.delta) {
+                        lineBuffer += event.delta;
+                        if (lineBuffer.length > 50) { lineBuffer = ''; }  // 超长行不参与检测
+                        if (lineBuffer.indexOf('\n') !== -1) {
+                            const nlParts = lineBuffer.split('\n');
+                            lineBuffer = nlParts.pop()!;
+                            for (const completedLine of nlParts) {
+                                const trimLine = completedLine.trim();
+                                if (!trimLine) continue;
+                                if (trimLine === lastLine) {
+                                    lineRepeatCount++;
+                                    if (lineRepeatCount >= REPEAT_THRESHOLD) {
+                                        console.warn(`[Cursor] ⚠️ 检测到行级重复: "${trimLine.substring(0, 60)}" 已连续重复 ${lineRepeatCount} 次，中止流`);
+                                        lineRepeatAborted = true;
+                                        reader.cancel();
+                                        break;
+                                    }
+                                } else {
+                                    lastLine = trimLine;
+                                    lineRepeatCount = 1;
+                                }
+                            }
+                            if (lineRepeatAborted) break;
+                        }
+                    }
+
                     onChunk(event);
                 } catch {
                     // 非 JSON 数据，忽略
                 }
             }
 
-            if (degenerateAborted) break;
+            if (degenerateAborted || lineRepeatAborted) break;
         }
 
         // ★ 退化循环中止后，抛出特殊错误让外层 sendCursorRequest 不再重试
         if (degenerateAborted) {
             throw new Error('DEGENERATE_LOOP_ABORTED');
+        }
+        // ★ 行级重复中止后，抛出普通错误让外层 sendCursorRequest 走正常重试
+        if (lineRepeatAborted) {
+            throw new Error('LINE_REPEAT_ABORTED');
         }
 
         // 处理剩余 buffer
